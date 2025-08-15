@@ -1,0 +1,22 @@
+{
+  "name": "video-analyzer",
+  "version": "1.0.0",
+  "description": "Servidor Node.js para analizar videos de Google Drive con Gemini AI",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["node", "express", "google-drive", "gemini-ai", "sqlite"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "better-sqlite3": "^9.2.2",
+    "googleapis": "^129.0.0",
+    "@google/generative-ai": "^0.2.1",
+    "dotenv": "^16.3.1"
+  }
+}
