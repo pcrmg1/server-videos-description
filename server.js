@@ -159,20 +159,29 @@ async function getVideoDescription(filePath) {
 
     const prompt = `Analiza este video y proporciona una respuesta en formato JSON con la siguiente estructura exacta:
     {
-      "texto_visible": "descripción del texto visible" o false si no hay texto,
+      "texto_visible": "transcripción COMPLETA y DETALLADA de TODO el texto visible, incluyendo títulos, subtítulos, frases, números, palabras clave, etc. Separa cada elemento de texto con saltos de línea y mantén el orden de aparición" o false si no hay texto,
       "musica_fondo": "descripción de la música y género" o false si no hay música,
       "objetos_presentes": "descripción de objetos visibles" o false si no hay objetos relevantes,
       "personas": "descripción general de personas" o false si no hay personas,
       "acciones": "descripción de acciones realizadas" o false si no hay acciones,
       "colores_predominantes": "descripción de colores principales" (siempre debe tener valor),
       "ambiente_contexto": "descripción del ambiente y contexto" (siempre debe tener valor),
-      "dialogo_narracion": "descripción del audio/diálogo" o false si no hay audio
+      "dialogo_narracion": "transcripción LITERAL y COMPLETA de todo lo que se dice en el video, palabra por palabra, tal como se pronuncia. Incluye pausas naturales, muletillas, repeticiones y el diálogo exacto sin resumir ni parafrasear" o false si no hay audio/diálogo,
+      "duracion_segundos": número entero con la duración aproximada del video en segundos,
+      "duracion_formato": "formato legible de la duración (ej: '2:30', '1:15:45')"
     }
     
     IMPORTANTE: 
     - Responde ÚNICAMENTE con el JSON válido, sin texto adicional
     - Usa false (booleano) cuando no detectes algo, NO strings como "No se detecta"
-    - Los campos colores_predominantes y ambiente_contexto siempre deben tener descripción
+    - Para texto_visible: Lee y transcribe TODO el texto que aparezca en pantalla, palabra por palabra, manteniendo el formato y orden original
+    - Si hay listas numeradas, mantén la numeración exacta
+    - Si hay títulos o subtítulos, especifica cuáles son
+    - No resumas el texto, transcríbelo completamente
+    - Para dialogo_narracion: Transcribe LITERALMENTE todo lo que se dice, palabra por palabra, tal como se pronuncia. NO resumas, NO parafrasees, NO interpretes. Incluye muletillas como "eh", "mm", "este", pausas naturales, repeticiones, etc.
+    - Los campos colores_predominantes, ambiente_contexto, duracion_segundos y duracion_formato siempre deben tener valor
+    - Para la duración, analiza todo el contenido del video y proporciona una estimación precisa
+    - El formato de duración debe ser MM:SS para videos menores a 1 hora, o HH:MM:SS para videos de 1 hora o más
     - Todas las descripciones deben ser en español`;
 
     const result = await model.generateContent([
