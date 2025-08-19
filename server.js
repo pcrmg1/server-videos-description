@@ -71,7 +71,9 @@ const getVideoFromDB = (driveId) => {
 const insertVideo = (driveId, description, tokenUsage = null) => {
   return new Promise((resolve, reject) => {
     const tokenUsageJson = tokenUsage ? JSON.stringify(tokenUsage) : null;
-    db.run('INSERT INTO videos (drive_id, description, token_usage) VALUES (?, ?, ?)', [driveId, description, tokenUsageJson], function (err) {
+    // Si description es un objeto, convertirlo a JSON string para almacenar
+    const descriptionJson = typeof description === 'object' ? JSON.stringify(description) : description;
+    db.run('INSERT INTO videos (drive_id, description, token_usage) VALUES (?, ?, ?)', [driveId, descriptionJson, tokenUsageJson], function (err) {
       if (err) reject(err);
       else resolve({ id: this.lastID, changes: this.changes });
     });
@@ -89,7 +91,9 @@ const getAllVideos = () => {
 
 const updateVideo = (description, driveId) => {
   return new Promise((resolve, reject) => {
-    db.run('UPDATE videos SET description = ? WHERE drive_id = ?', [description, driveId], function (err) {
+    // Si description es un objeto, convertirlo a JSON string para almacenar
+    const descriptionJson = typeof description === 'object' ? JSON.stringify(description) : description;
+    db.run('UPDATE videos SET description = ? WHERE drive_id = ?', [descriptionJson, driveId], function (err) {
       if (err) reject(err);
       else resolve({ changes: this.changes });
     });
@@ -153,17 +157,23 @@ async function getVideoDescription(filePath) {
     // Leer el archivo como buffer
     const videoBuffer = fs.readFileSync(filePath);
 
-    const prompt = `Analiza este video y proporciona una descripción detallada en español que incluya:
-    - Texto visible en pantalla (si existe)
-    - Música de fondo y su género (si existe)
-    - Objetos presentes en el video
-    - Personas que aparecen (descripción general, sin nombres específicos)
-    - Acciones que se realizan
-    - Colores predominantes
-    - Ambiente y contexto general
-    - Transcripción de cualquier diálogo o narración (si es audible)
+    const prompt = `Analiza este video y proporciona una respuesta en formato JSON con la siguiente estructura exacta:
+    {
+      "texto_visible": "descripción del texto visible" o false si no hay texto,
+      "musica_fondo": "descripción de la música y género" o false si no hay música,
+      "objetos_presentes": "descripción de objetos visibles" o false si no hay objetos relevantes,
+      "personas": "descripción general de personas" o false si no hay personas,
+      "acciones": "descripción de acciones realizadas" o false si no hay acciones,
+      "colores_predominantes": "descripción de colores principales" (siempre debe tener valor),
+      "ambiente_contexto": "descripción del ambiente y contexto" (siempre debe tener valor),
+      "dialogo_narracion": "descripción del audio/diálogo" o false si no hay audio
+    }
     
-    Proporciona una descripción completa y estructurada.`;
+    IMPORTANTE: 
+    - Responde ÚNICAMENTE con el JSON válido, sin texto adicional
+    - Usa false (booleano) cuando no detectes algo, NO strings como "No se detecta"
+    - Los campos colores_predominantes y ambiente_contexto siempre deben tener descripción
+    - Todas las descripciones deben ser en español`;
 
     const result = await model.generateContent([
       prompt,
@@ -179,7 +189,21 @@ async function getVideoDescription(filePath) {
 
     // Obtener información de uso de tokens
     const usageMetadata = response.usageMetadata;
-    const description = response.text();
+    let description = response.text().trim();
+
+    // Limpiar la respuesta para asegurar que sea JSON válido
+    // Remover posibles markdown code blocks
+    description = description.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+
+    // Validar que sea JSON válido
+    try {
+      const parsedDescription = JSON.parse(description);
+      // Si el parsing es exitoso, usar el objeto parseado
+      description = parsedDescription;
+    } catch (jsonError) {
+      console.error('Error: Gemini no devolvió JSON válido:', description);
+      throw new Error('La respuesta de Gemini no es un JSON válido');
+    }
 
     return {
       description,
@@ -222,6 +246,15 @@ app.post('/', async (req, res) => {
     const existingVideo = await getVideoFromDB(videoId);
 
     if (existingVideo) {
+      // Parsear description si es un JSON string
+      let parsedDescription = existingVideo.description;
+      try {
+        parsedDescription = JSON.parse(existingVideo.description);
+      } catch (e) {
+        // Si no es JSON válido, mantener como string
+        console.warn('Description no es JSON válido, manteniendo como string');
+      }
+
       // Parsear token usage si existe
       let tokenUsage = null;
       if (existingVideo.token_usage) {
@@ -234,7 +267,7 @@ app.post('/', async (req, res) => {
 
       return res.json({
         drive_id: existingVideo.drive_id,
-        description: existingVideo.description,
+        description: parsedDescription,
         cached: true,
         tokenUsage: tokenUsage
       });
@@ -289,6 +322,15 @@ app.get('/videos', async (req, res) => {
 
     // Parsear token usage para cada video
     const videosWithTokenUsage = videos.map(video => {
+      // Parsear description si es un JSON string
+      let parsedDescription = video.description;
+      try {
+        parsedDescription = JSON.parse(video.description);
+      } catch (e) {
+        // Si no es JSON válido, mantener como string
+        console.warn(`Description del video ${video.drive_id} no es JSON válido, manteniendo como string`);
+      }
+
       let tokenUsage = null;
       if (video.token_usage) {
         try {
@@ -300,6 +342,7 @@ app.get('/videos', async (req, res) => {
 
       return {
         ...video,
+        description: parsedDescription,
         tokenUsage: tokenUsage,
         token_usage: undefined // Remover el campo raw
       };
@@ -330,6 +373,15 @@ app.get('/videos/:driveId', async (req, res) => {
       });
     }
 
+    // Parsear description si es un JSON string
+    let parsedDescription = video.description;
+    try {
+      parsedDescription = JSON.parse(video.description);
+    } catch (e) {
+      // Si no es JSON válido, mantener como string
+      console.warn('Description no es JSON válido, manteniendo como string');
+    }
+
     // Parsear token usage si existe
     let tokenUsage = null;
     if (video.token_usage) {
@@ -342,6 +394,7 @@ app.get('/videos/:driveId', async (req, res) => {
 
     res.json({
       ...video,
+      description: parsedDescription,
       tokenUsage: tokenUsage,
       token_usage: undefined // Remover el campo raw
     });
