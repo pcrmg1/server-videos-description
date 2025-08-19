@@ -9,14 +9,21 @@
     "dev": "node --watch server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["node", "express", "google-drive", "gemini-ai", "sqlite"],
+  "keywords": [
+    "node",
+    "express",
+    "google-drive",
+    "gemini-ai",
+    "sqlite"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.18.2",
-    "better-sqlite3": "^9.2.2",
-    "googleapis": "^129.0.0",
     "@google/generative-ai": "^0.2.1",
-    "dotenv": "^16.3.1"
-  }
+    "dotenv": "^17.2.1",
+    "express": "^4.18.2",
+    "googleapis": "^129.0.0",
+    "sqlite3": "^5.1.6"
+  },
+  "packageManager": "pnpm@8.14.0+sha1.bb42032ff80dba5f9245bc1b03470d2fa0b7fb2f"
 }

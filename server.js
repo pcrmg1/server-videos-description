@@ -1,5 +1,5 @@
 const express = require('express');
-const Database = require('better-sqlite3');
+const sqlite3 = require('sqlite3').verbose();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { google } = require('googleapis');
 const fs = require('fs');
@@ -13,16 +13,29 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 // Inicializar base de datos
-const db = new Database('videos.db');
+const db = new sqlite3.Database('videos.db');
 
 // Crear tabla si no existe
-db.exec(`
+db.serialize(() => {
+  db.run(`
   CREATE TABLE IF NOT EXISTS videos (
     drive_id TEXT PRIMARY KEY,
     description TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    token_usage TEXT
   )
-`);
+  `);
+
+  // Agregar columna token_usage si no existe (para bases de datos existentes)
+  db.run(`
+    ALTER TABLE videos ADD COLUMN token_usage TEXT
+  `, (err) => {
+    // Ignorar error si la columna ya existe
+    if (err && !err.message.includes('duplicate column name')) {
+      console.error('Error agregando columna token_usage:', err.message);
+    }
+  });
+});
 
 // Configurar Google Drive API
 let drive;
@@ -45,12 +58,52 @@ try {
   console.error('Error configurando Gemini AI:', error.message);
 }
 
-// Función para verificar si el archivo existe en la base de datos
-const getVideoFromDB = db.prepare('SELECT * FROM videos WHERE drive_id = ?');
-const insertVideo = db.prepare('INSERT INTO videos (drive_id, description) VALUES (?, ?)');
-const getAllVideos = db.prepare('SELECT * FROM videos ORDER BY created_at DESC');
-const updateVideo = db.prepare('UPDATE videos SET description = ? WHERE drive_id = ?');
-const deleteVideo = db.prepare('DELETE FROM videos WHERE drive_id = ?');
+// Funciones de base de datos con promesas
+const getVideoFromDB = (driveId) => {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM videos WHERE drive_id = ?', [driveId], (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+};
+
+const insertVideo = (driveId, description, tokenUsage = null) => {
+  return new Promise((resolve, reject) => {
+    const tokenUsageJson = tokenUsage ? JSON.stringify(tokenUsage) : null;
+    db.run('INSERT INTO videos (drive_id, description, token_usage) VALUES (?, ?, ?)', [driveId, description, tokenUsageJson], function (err) {
+      if (err) reject(err);
+      else resolve({ id: this.lastID, changes: this.changes });
+    });
+  });
+};
+
+const getAllVideos = () => {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT * FROM videos ORDER BY created_at DESC', [], (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+};
+
+const updateVideo = (description, driveId) => {
+  return new Promise((resolve, reject) => {
+    db.run('UPDATE videos SET description = ? WHERE drive_id = ?', [description, driveId], function (err) {
+      if (err) reject(err);
+      else resolve({ changes: this.changes });
+    });
+  });
+};
+
+const deleteVideo = (driveId) => {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM videos WHERE drive_id = ?', [driveId], function (err) {
+      if (err) reject(err);
+      else resolve({ changes: this.changes });
+    });
+  });
+};
 
 // Función para descargar video de Google Drive
 async function downloadVideoFromDrive(videoId) {
@@ -96,10 +149,10 @@ async function getVideoDescription(filePath) {
 
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    
+
     // Leer el archivo como buffer
     const videoBuffer = fs.readFileSync(filePath);
-    
+
     const prompt = `Analiza este video y proporciona una descripción detallada en español que incluya:
     - Texto visible en pantalla (si existe)
     - Música de fondo y su género (si existe)
@@ -108,6 +161,7 @@ async function getVideoDescription(filePath) {
     - Acciones que se realizan
     - Colores predominantes
     - Ambiente y contexto general
+    - Transcripción de cualquier diálogo o narración (si es audible)
     
     Proporciona una descripción completa y estructurada.`;
 
@@ -122,7 +176,19 @@ async function getVideoDescription(filePath) {
     ]);
 
     const response = await result.response;
-    return response.text();
+
+    // Obtener información de uso de tokens
+    const usageMetadata = response.usageMetadata;
+    const description = response.text();
+
+    return {
+      description,
+      tokenUsage: {
+        promptTokens: usageMetadata?.promptTokenCount || 0,
+        candidatesTokens: usageMetadata?.candidatesTokenCount || 0,
+        totalTokens: usageMetadata?.totalTokenCount || 0
+      }
+    };
   } catch (error) {
     console.error('Error obteniendo descripción:', error.message);
     throw new Error(`No se pudo obtener la descripción: ${error.message}`);
@@ -146,54 +212,70 @@ app.post('/', async (req, res) => {
   const { videoId } = req.body;
 
   if (!videoId) {
-    return res.status(400).json({ 
-      error: 'El campo videoId es requerido' 
+    return res.status(400).json({
+      error: 'El campo videoId es requerido'
     });
   }
 
   try {
     // Verificar si ya existe en la base de datos
-    const existingVideo = getVideoFromDB.get(videoId);
-    
+    const existingVideo = await getVideoFromDB(videoId);
+
     if (existingVideo) {
+      // Parsear token usage si existe
+      let tokenUsage = null;
+      if (existingVideo.token_usage) {
+        try {
+          tokenUsage = JSON.parse(existingVideo.token_usage);
+        } catch (e) {
+          console.warn('Error parseando token_usage:', e.message);
+        }
+      }
+
       return res.json({
         drive_id: existingVideo.drive_id,
         description: existingVideo.description,
-        cached: true
+        cached: true,
+        tokenUsage: tokenUsage
       });
     }
 
     // Si no existe, procesar el video
     console.log(`Procesando video nuevo: ${videoId}`);
-    
+
     // Descargar video de Google Drive
     const filePath = await downloadVideoFromDrive(videoId);
     console.log(`Video descargado: ${filePath}`);
 
     let description;
+    let tokenUsage;
     try {
       // Obtener descripción con Gemini
-      description = await getVideoDescription(filePath);
+      const result = await getVideoDescription(filePath);
+      description = result.description;
+      tokenUsage = result.tokenUsage;
       console.log(`Descripción obtenida para ${videoId}`);
+      console.log(`Tokens utilizados:`, tokenUsage);
     } finally {
       // Siempre eliminar el archivo temporal
       cleanupTempFile(filePath);
     }
 
     // Guardar en base de datos
-    insertVideo.run(videoId, description);
+    await insertVideo(videoId, description, tokenUsage);
     console.log(`Video guardado en BD: ${videoId}`);
 
     res.json({
       drive_id: videoId,
       description: description,
-      cached: false
+      cached: false,
+      tokenUsage: tokenUsage
     });
 
   } catch (error) {
     console.error('Error procesando video:', error.message);
-    res.status(500).json({ 
-      error: `Error procesando video: ${error.message}` 
+    res.status(500).json({
+      error: `Error procesando video: ${error.message}`
     });
   }
 });
@@ -201,98 +283,131 @@ app.post('/', async (req, res) => {
 // CRUD ENDPOINTS
 
 // GET /videos - Obtener todos los videos
-app.get('/videos', (req, res) => {
+app.get('/videos', async (req, res) => {
   try {
-    const videos = getAllVideos.all();
+    const videos = await getAllVideos();
+
+    // Parsear token usage para cada video
+    const videosWithTokenUsage = videos.map(video => {
+      let tokenUsage = null;
+      if (video.token_usage) {
+        try {
+          tokenUsage = JSON.parse(video.token_usage);
+        } catch (e) {
+          console.warn(`Error parseando token_usage para video ${video.drive_id}:`, e.message);
+        }
+      }
+
+      return {
+        ...video,
+        tokenUsage: tokenUsage,
+        token_usage: undefined // Remover el campo raw
+      };
+    });
+
     res.json({
-      count: videos.length,
-      videos: videos
+      count: videosWithTokenUsage.length,
+      videos: videosWithTokenUsage
     });
   } catch (error) {
     console.error('Error obteniendo videos:', error.message);
-    res.status(500).json({ 
-      error: `Error obteniendo videos: ${error.message}` 
+    res.status(500).json({
+      error: `Error obteniendo videos: ${error.message}`
     });
   }
 });
 
 // GET /videos/:driveId - Obtener un video específico
-app.get('/videos/:driveId', (req, res) => {
+app.get('/videos/:driveId', async (req, res) => {
   const { driveId } = req.params;
 
   try {
-    const video = getVideoFromDB.get(driveId);
-    
+    const video = await getVideoFromDB(driveId);
+
     if (!video) {
-      return res.status(404).json({ 
-        error: 'Video no encontrado' 
+      return res.status(404).json({
+        error: 'Video no encontrado'
       });
     }
 
-    res.json(video);
+    // Parsear token usage si existe
+    let tokenUsage = null;
+    if (video.token_usage) {
+      try {
+        tokenUsage = JSON.parse(video.token_usage);
+      } catch (e) {
+        console.warn('Error parseando token_usage:', e.message);
+      }
+    }
+
+    res.json({
+      ...video,
+      tokenUsage: tokenUsage,
+      token_usage: undefined // Remover el campo raw
+    });
   } catch (error) {
     console.error('Error obteniendo video:', error.message);
-    res.status(500).json({ 
-      error: `Error obteniendo video: ${error.message}` 
+    res.status(500).json({
+      error: `Error obteniendo video: ${error.message}`
     });
   }
 });
 
 // PUT /videos/:driveId - Actualizar descripción de un video
-app.put('/videos/:driveId', (req, res) => {
+app.put('/videos/:driveId', async (req, res) => {
   const { driveId } = req.params;
   const { description } = req.body;
 
   if (!description) {
-    return res.status(400).json({ 
-      error: 'El campo description es requerido' 
+    return res.status(400).json({
+      error: 'El campo description es requerido'
     });
   }
 
   try {
-    const result = updateVideo.run(description, driveId);
-    
+    const result = await updateVideo(description, driveId);
+
     if (result.changes === 0) {
-      return res.status(404).json({ 
-        error: 'Video no encontrado' 
+      return res.status(404).json({
+        error: 'Video no encontrado'
       });
     }
 
     // Obtener el video actualizado
-    const updatedVideo = getVideoFromDB.get(driveId);
+    const updatedVideo = await getVideoFromDB(driveId);
     res.json({
       message: 'Descripción actualizada exitosamente',
       video: updatedVideo
     });
   } catch (error) {
     console.error('Error actualizando video:', error.message);
-    res.status(500).json({ 
-      error: `Error actualizando video: ${error.message}` 
+    res.status(500).json({
+      error: `Error actualizando video: ${error.message}`
     });
   }
 });
 
 // DELETE /videos/:driveId - Eliminar un video
-app.delete('/videos/:driveId', (req, res) => {
+app.delete('/videos/:driveId', async (req, res) => {
   const { driveId } = req.params;
 
   try {
-    const result = deleteVideo.run(driveId);
-    
+    const result = await deleteVideo(driveId);
+
     if (result.changes === 0) {
-      return res.status(404).json({ 
-        error: 'Video no encontrado' 
+      return res.status(404).json({
+        error: 'Video no encontrado'
       });
     }
 
-    res.json({ 
+    res.json({
       message: 'Video eliminado exitosamente',
       drive_id: driveId
     });
   } catch (error) {
     console.error('Error eliminando video:', error.message);
-    res.status(500).json({ 
-      error: `Error eliminando video: ${error.message}` 
+    res.status(500).json({
+      error: `Error eliminando video: ${error.message}`
     });
   }
 });
@@ -312,16 +427,16 @@ app.get('/health', (req, res) => {
 
 // Middleware para rutas no encontradas
 app.use('*', (req, res) => {
-  res.status(404).json({ 
-    error: 'Ruta no encontrada' 
+  res.status(404).json({
+    error: 'Ruta no encontrada'
   });
 });
 
 // Middleware global de manejo de errores
 app.use((error, req, res, next) => {
   console.error('Error no manejado:', error);
-  res.status(500).json({ 
-    error: 'Error interno del servidor' 
+  res.status(500).json({
+    error: 'Error interno del servidor'
   });
 });
 
