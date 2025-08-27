@@ -204,14 +204,40 @@ async function getVideoDescription(filePath) {
     // Remover posibles markdown code blocks
     description = description.replace(/```json\n?/g, '').replace(/```\n?/g, '');
 
+    // Remover espacios en blanco al inicio y final
+    description = description.trim();
+
     // Validar que sea JSON válido
     try {
       const parsedDescription = JSON.parse(description);
       // Si el parsing es exitoso, usar el objeto parseado
       description = parsedDescription;
     } catch (jsonError) {
-      console.error('Error: Gemini no devolvió JSON válido:', description);
-      throw new Error('La respuesta de Gemini no es un JSON válido');
+      console.error('Error parseando JSON de Gemini:', jsonError.message);
+      console.error('Respuesta recibida:', description);
+
+      // Intentar limpiar caracteres problemáticos
+      try {
+        // Remover caracteres de control y espacios extra
+        const cleanedDescription = description
+          .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remover caracteres de control
+          .replace(/\n\s*\n/g, '\n') // Remover líneas vacías múltiples
+          .trim();
+
+        const parsedDescription = JSON.parse(cleanedDescription);
+        description = parsedDescription;
+        console.log('JSON parseado exitosamente después de limpieza');
+      } catch (secondError) {
+        console.error('Error en segundo intento de parsing:', secondError.message);
+
+        // Como último recurso, crear un objeto con la respuesta como string
+        description = {
+          error: 'JSON parsing failed',
+          raw_response: description,
+          parsed_at: new Date().toISOString()
+        };
+        console.log('Usando respuesta raw como fallback');
+      }
     }
 
     return {
