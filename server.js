@@ -153,12 +153,12 @@ async function getVideoDescription(filePath) {
 
   try {
     // Intentar con diferentes modelos en orden de preferencia
+    // Intentar con diferentes modelos en orden de preferencia
     const modelNames = [
-      "gemini-1.5-pro",
-      "gemini-1.5-flash-latest",
-      "gemini-pro-vision",
-      "gemini-pro"
+      "gemini-2.5-pro",     // mejor calidad, más tokens
+      "gemini-2.5-flash"    // más rápido y económico
     ];
+
 
     let model;
     let modelUsed;
