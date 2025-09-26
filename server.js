@@ -152,7 +152,32 @@ async function getVideoDescription(filePath) {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    // Intentar con diferentes modelos en orden de preferencia
+    const modelNames = [
+      "gemini-1.5-pro",
+      "gemini-1.5-flash-latest",
+      "gemini-pro-vision",
+      "gemini-pro"
+    ];
+
+    let model;
+    let modelUsed;
+
+    for (const modelName of modelNames) {
+      try {
+        model = genAI.getGenerativeModel({ model: modelName });
+        modelUsed = modelName;
+        console.log(`Usando modelo: ${modelName}`);
+        break;
+      } catch (modelError) {
+        console.warn(`Modelo ${modelName} no disponible:`, modelError.message);
+        continue;
+      }
+    }
+
+    if (!model) {
+      throw new Error('No se pudo inicializar ningún modelo de Gemini disponible');
+    }
 
     // Leer el archivo como buffer
     const videoBuffer = fs.readFileSync(filePath);
@@ -184,15 +209,67 @@ async function getVideoDescription(filePath) {
     - El formato de duración debe ser MM:SS para videos menores a 1 hora, o HH:MM:SS para videos de 1 hora o más
     - Todas las descripciones deben ser en español`;
 
-    const result = await model.generateContent([
-      prompt,
-      {
-        inlineData: {
-          data: videoBuffer.toString('base64'),
-          mimeType: 'video/mp4' // Asumiendo MP4, se puede detectar dinámicamente
+    // Detectar el tipo MIME del archivo
+    const fileExtension = path.extname(filePath).toLowerCase();
+    let mimeType = 'video/mp4'; // Default
+
+    switch (fileExtension) {
+      case '.mp4':
+        mimeType = 'video/mp4';
+        break;
+      case '.avi':
+        mimeType = 'video/x-msvideo';
+        break;
+      case '.mov':
+        mimeType = 'video/quicktime';
+        break;
+      case '.wmv':
+        mimeType = 'video/x-ms-wmv';
+        break;
+      case '.webm':
+        mimeType = 'video/webm';
+        break;
+      default:
+        console.warn(`Extensión de archivo desconocida: ${fileExtension}, usando video/mp4`);
+    }
+
+    console.log(`Procesando video con MIME type: ${mimeType}`);
+
+    let result;
+    try {
+      result = await model.generateContent([
+        prompt,
+        {
+          inlineData: {
+            data: videoBuffer.toString('base64'),
+            mimeType: mimeType
+          }
         }
+      ]);
+    } catch (generateError) {
+      console.error(`Error generando contenido con modelo ${modelUsed}:`, generateError.message);
+
+      // Si falla con el modelo actual, intentar con el siguiente
+      if (modelNames.indexOf(modelUsed) < modelNames.length - 1) {
+        console.log('Intentando con modelo alternativo...');
+        const nextModelIndex = modelNames.indexOf(modelUsed) + 1;
+        const nextModel = genAI.getGenerativeModel({ model: modelNames[nextModelIndex] });
+        modelUsed = modelNames[nextModelIndex];
+        console.log(`Reintentando con modelo: ${modelUsed}`);
+
+        result = await nextModel.generateContent([
+          prompt,
+          {
+            inlineData: {
+              data: videoBuffer.toString('base64'),
+              mimeType: mimeType
+            }
+          }
+        ]);
+      } else {
+        throw generateError;
       }
-    ]);
+    }
 
     const response = await result.response;
 
@@ -242,6 +319,7 @@ async function getVideoDescription(filePath) {
 
     return {
       description,
+      modelUsed,
       tokenUsage: {
         promptTokens: usageMetadata?.promptTokenCount || 0,
         candidatesTokens: usageMetadata?.candidatesTokenCount || 0,
@@ -250,7 +328,17 @@ async function getVideoDescription(filePath) {
     };
   } catch (error) {
     console.error('Error obteniendo descripción:', error.message);
-    throw new Error(`No se pudo obtener la descripción: ${error.message}`);
+
+    // Proporcionar información más detallada del error
+    if (error.message.includes('404') || error.message.includes('not found')) {
+      throw new Error(`Modelo de Gemini no disponible. Verifica tu API key y que tengas acceso a los modelos de Gemini. Error: ${error.message}`);
+    } else if (error.message.includes('403') || error.message.includes('permission')) {
+      throw new Error(`Sin permisos para usar Gemini AI. Verifica tu API key y configuración. Error: ${error.message}`);
+    } else if (error.message.includes('quota') || error.message.includes('limit')) {
+      throw new Error(`Límite de cuota excedido en Gemini AI. Error: ${error.message}`);
+    } else {
+      throw new Error(`No se pudo obtener la descripción: ${error.message}`);
+    }
   }
 }
 
@@ -317,12 +405,15 @@ app.post('/', async (req, res) => {
 
     let description;
     let tokenUsage;
+    let modelUsed;
     try {
       // Obtener descripción con Gemini
       const result = await getVideoDescription(filePath);
       description = result.description;
       tokenUsage = result.tokenUsage;
+      modelUsed = result.modelUsed;
       console.log(`Descripción obtenida para ${videoId}`);
+      console.log(`Modelo utilizado: ${modelUsed}`);
       console.log(`Tokens utilizados:`, tokenUsage);
     } finally {
       // Siempre eliminar el archivo temporal
@@ -337,6 +428,7 @@ app.post('/', async (req, res) => {
       drive_id: videoId,
       description: description,
       cached: false,
+      modelUsed: modelUsed,
       tokenUsage: tokenUsage
     });
 
