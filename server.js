@@ -327,7 +327,7 @@ async function getVideoDescription(filePath) {
     const modelConfigs = [
       { 
         name: "gemini-2.5-flash", 
-        maxSizeMB: 50,
+        maxSizeMB: 150,
         description: "Modelo rápido y eficiente"
       },
       { 
