@@ -326,16 +326,17 @@ async function getVideoDescription(filePath) {
     // Configuración de modelos con límites de tamaño
     const modelConfigs = [
       { 
-        name: "gemini-1.5-flash", 
+        name: "gemini-2.5-flash", 
         maxSizeMB: 50,
         description: "Modelo rápido y eficiente"
       },
       { 
-        name: "gemini-1.5-pro", 
+        name: "gemini-2.5-pro", 
         maxSizeMB: 30,
         description: "Modelo de alta calidad"
       }
     ];
+
 
     // Filtrar modelos según el tamaño del archivo
     const availableModels = modelConfigs.filter(config => fileSizeInMB <= config.maxSizeMB);
