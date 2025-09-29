@@ -5,8 +5,8 @@
   "main": "server.js",
   "private": true,
   "scripts": {
-    "start": "node server.js",
-    "start:gc": "node --expose-gc server.js",
+    "start:gc": "node server.js",
+    "start": "node --expose-gc server.js",
     "dev": "node --watch --expose-gc server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
