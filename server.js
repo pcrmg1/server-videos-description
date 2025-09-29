@@ -12,7 +12,140 @@ const PORT = process.env.PORT || 3000;
 // Configuración para limitar concurrencia y memoria
 const MAX_CONCURRENT_REQUESTS = 2; // Máximo 2 videos procesándose simultáneamente
 let currentProcessing = 0;
-const processingQueue = [];
+
+// Sistema de cola mejorado
+class ProcessingQueue {
+  constructor() {
+    this.queue = [];
+    this.processing = false;
+  }
+
+  add(videoId, res) {
+    this.queue.push({ videoId, res, timestamp: Date.now() });
+    console.log(`📋 Video ${videoId} agregado a la cola. Posición: ${this.queue.length}`);
+    this.processNext();
+  }
+
+  async processNext() {
+    if (this.processing || this.queue.length === 0 || currentProcessing >= MAX_CONCURRENT_REQUESTS) {
+      return;
+    }
+
+    this.processing = true;
+    const { videoId, res } = this.queue.shift();
+    
+    console.log(`🎬 Procesando video de la cola: ${videoId} (${this.queue.length} restantes)`);
+    
+    try {
+      currentProcessing++;
+      await this.processVideo(videoId, res);
+    } catch (error) {
+      console.error(`❌ Error procesando video de la cola ${videoId}:`, error.message);
+      res.status(500).json({
+        error: `Error procesando video: ${error.message}`
+      });
+    } finally {
+      currentProcessing--;
+      this.processing = false;
+      // Procesar siguiente video en la cola
+      setTimeout(() => this.processNext(), 1000);
+    }
+  }
+
+  async processVideo(videoId, res) {
+    // Verificar si ya existe en la base de datos
+    const existingVideo = await getVideoFromDB(videoId);
+
+    if (existingVideo) {
+      console.log(`✅ Video encontrado en cache: ${videoId}`);
+      let parsedDescription = existingVideo.description;
+      try {
+        parsedDescription = JSON.parse(existingVideo.description);
+      } catch (e) {
+        console.warn('Description no es JSON válido, manteniendo como string');
+      }
+
+      let tokenUsage = null;
+      if (existingVideo.token_usage) {
+        try {
+          tokenUsage = JSON.parse(existingVideo.token_usage);
+        } catch (e) {
+          console.warn('Error parseando token_usage:', e.message);
+        }
+      }
+
+      return res.json({
+        drive_id: existingVideo.drive_id,
+        description: parsedDescription,
+        cached: true,
+        tokenUsage: tokenUsage
+      });
+    }
+
+    // Si no existe, procesar el video
+    console.log(`Procesando video nuevo: ${videoId}`);
+
+    let filePath;
+    try {
+      filePath = await downloadVideoFromDrive(videoId);
+      console.log(`📥 Video descargado: ${filePath}`);
+    } catch (downloadError) {
+      console.error(`❌ Error descargando video ${videoId}:`, downloadError.message);
+      throw downloadError;
+    }
+
+    let description;
+    let tokenUsage;
+    let modelUsed;
+    
+    try {
+      console.log(`🤖 Iniciando análisis con Gemini para ${videoId}...`);
+      const result = await getVideoDescription(filePath);
+      description = result.description;
+      tokenUsage = result.tokenUsage;
+      modelUsed = result.modelUsed;
+      console.log(`✅ Descripción obtenida para ${videoId}`);
+      console.log(`🔧 Modelo utilizado: ${modelUsed}`);
+      console.log(`📊 Tokens utilizados:`, tokenUsage);
+    } catch (analysisError) {
+      console.error(`❌ Error analizando video ${videoId}:`, analysisError.message);
+      throw analysisError;
+    } finally {
+      if (filePath) {
+        cleanupTempFile(filePath);
+      }
+    }
+
+    try {
+      await insertVideo(videoId, description, tokenUsage);
+      console.log(`💾 Video guardado en BD: ${videoId}`);
+    } catch (dbError) {
+      console.error(`❌ Error guardando en BD ${videoId}:`, dbError.message);
+      throw dbError;
+    }
+
+    console.log(`🎉 Procesamiento completado exitosamente: ${videoId}`);
+    
+    res.json({
+      drive_id: videoId,
+      description: description,
+      cached: false,
+      modelUsed: modelUsed,
+      tokenUsage: tokenUsage
+    });
+  }
+
+  getStatus() {
+    return {
+      queueLength: this.queue.length,
+      processing: this.processing,
+      currentProcessing: currentProcessing,
+      maxConcurrent: MAX_CONCURRENT_REQUESTS
+    };
+  }
+}
+
+const processingQueue = new ProcessingQueue();
 
 // Middleware
 app.use(express.json());
@@ -21,20 +154,18 @@ app.use(express.json());
 const concurrencyLimiter = (req, res, next) => {
   if (req.path === '/' && req.method === 'POST') {
     if (currentProcessing >= MAX_CONCURRENT_REQUESTS) {
-      return res.status(429).json({
-        error: 'Servidor ocupado procesando videos. Intenta nuevamente en unos segundos.',
-        currentProcessing,
-        maxConcurrent: MAX_CONCURRENT_REQUESTS
-      });
+      // En lugar de rechazar, agregar a la cola
+      const { videoId } = req.body;
+      if (!videoId) {
+        return res.status(400).json({
+          error: 'El campo videoId es requerido'
+        });
+      }
+      
+      console.log(`🔄 Servidor ocupado, agregando video ${videoId} a la cola`);
+      processingQueue.add(videoId, res);
+      return; // No llamar next(), la respuesta se manejará desde la cola
     }
-    currentProcessing++;
-    
-    // Decrementar contador cuando termine la request
-    const originalEnd = res.end;
-    res.end = function(...args) {
-      currentProcessing--;
-      originalEnd.apply(this, args);
-    };
   }
   next();
 };
@@ -188,37 +319,92 @@ async function getVideoDescription(filePath) {
     console.log(`Tamaño del archivo: ${fileSizeInMB.toFixed(2)} MB`);
     
     // Limitar tamaño de archivo para evitar problemas de memoria
-    if (fileSizeInMB > 100) {
-      throw new Error(`Archivo demasiado grande (${fileSizeInMB.toFixed(2)} MB). Máximo permitido: 100 MB`);
+    if (fileSizeInMB > 50) {
+      throw new Error(`Archivo demasiado grande (${fileSizeInMB.toFixed(2)} MB). Máximo permitido: 50 MB`);
     }
 
-    // Intentar con diferentes modelos en orden de preferencia
-    const modelNames = [
-      "gemini-2.5-flash",   // Más rápido y usa menos memoria
-      "gemini-2.5-pro"      // Mejor calidad pero más pesado
+    // Configuración de modelos con límites de tamaño
+    const modelConfigs = [
+      { 
+        name: "gemini-1.5-flash", 
+        maxSizeMB: 50,
+        description: "Modelo rápido y eficiente"
+      },
+      { 
+        name: "gemini-1.5-pro", 
+        maxSizeMB: 30,
+        description: "Modelo de alta calidad"
+      }
     ];
 
-    // Para archivos grandes, usar solo el modelo flash
-    const modelsToTry = fileSizeInMB > 50 ? ["gemini-2.5-flash"] : modelNames;
+    // Filtrar modelos según el tamaño del archivo
+    const availableModels = modelConfigs.filter(config => fileSizeInMB <= config.maxSizeMB);
+    
+    if (availableModels.length === 0) {
+      throw new Error(`Archivo demasiado grande para todos los modelos disponibles (${fileSizeInMB.toFixed(2)} MB)`);
+    }
 
-    let model;
-    let modelUsed;
+    console.log(`Modelos disponibles para archivo de ${fileSizeInMB.toFixed(2)} MB:`, 
+      availableModels.map(m => m.name).join(', '));
 
-    for (const modelName of modelsToTry) {
+    // Función para intentar análisis con reintentos
+    const attemptAnalysis = async (modelConfig, retryCount = 0) => {
+      const maxRetries = 3;
+      const baseDelay = 2000; // 2 segundos
+      
       try {
-        model = genAI.getGenerativeModel({ model: modelName });
-        modelUsed = modelName;
-        console.log(`Usando modelo: ${modelName}`);
-        break;
-      } catch (modelError) {
-        console.warn(`Modelo ${modelName} no disponible:`, modelError.message);
-        continue;
+        console.log(`🤖 Intentando análisis con ${modelConfig.name} (intento ${retryCount + 1}/${maxRetries + 1})`);
+        
+        const model = genAI.getGenerativeModel({ model: modelConfig.name });
+        
+        // Configurar timeout más corto para detectar problemas rápidamente
+        const analysisPromise = model.generateContent([
+          prompt,
+          {
+            inlineData: {
+              data: videoBuffer.toString('base64'),
+              mimeType: mimeType
+            }
+          }
+        ]);
+        
+        // Timeout de 3 minutos para el análisis
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('Timeout: El análisis tomó demasiado tiempo')), 3 * 60 * 1000);
+        });
+        
+        const result = await Promise.race([analysisPromise, timeoutPromise]);
+        console.log(`✅ Análisis completado con ${modelConfig.name}`);
+        
+        return {
+          result,
+          modelUsed: modelConfig.name
+        };
+        
+      } catch (error) {
+        console.error(`❌ Error con ${modelConfig.name} (intento ${retryCount + 1}):`, error.message);
+        
+        // Verificar si es un error recuperable
+        const isRecoverableError = 
+          error.message.includes('500') || 
+          error.message.includes('Internal Server Error') ||
+          error.message.includes('503') ||
+          error.message.includes('502') ||
+          error.message.includes('timeout') ||
+          error.message.includes('network') ||
+          error.message.includes('ECONNRESET') ||
+          error.message.includes('ETIMEDOUT');
+        
+        if (isRecoverableError && retryCount < maxRetries) {
+          const delay = baseDelay * Math.pow(2, retryCount); // Backoff exponencial
+          console.log(`⏳ Reintentando en ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return attemptAnalysis(modelConfig, retryCount + 1);
+        }
+        
+        throw error;
       }
-    }
-
-    if (!model) {
-      throw new Error('No se pudo inicializar ningún modelo de Gemini disponible');
-    }
+    };
 
     // Leer el archivo como buffer con manejo de memoria optimizado
     let videoBuffer;
@@ -229,7 +415,8 @@ async function getVideoDescription(filePath) {
       throw new Error(`Error leyendo archivo: ${readError.message}`);
     }
 
-    const prompt = `Analiza este video y proporciona una respuesta en formato JSON con la siguiente estructura exacta:
+    // Prompt optimizado para reducir carga de procesamiento
+    const prompt = `Analiza este video y responde ÚNICAMENTE con JSON válido (sin markdown ni texto adicional):
     {
       "texto_visible": "transcripción COMPLETA y DETALLADA de TODO el texto visible, incluyendo títulos, subtítulos, frases, números, palabras clave, etc. Separa cada elemento de texto con saltos de línea y mantén el orden de aparición" o false si no hay texto,
       "musica_fondo": "descripción de la música y género" o false si no hay música,
@@ -243,18 +430,7 @@ async function getVideoDescription(filePath) {
       "duracion_formato": "formato legible de la duración (ej: '2:30', '1:15:45')"
     }
     
-    IMPORTANTE: 
-    - Responde ÚNICAMENTE con el JSON válido, sin texto adicional
-    - Usa false (booleano) cuando no detectes algo, NO strings como "No se detecta"
-    - Para texto_visible: Lee y transcribe TODO el texto que aparezca en pantalla, palabra por palabra, manteniendo el formato y orden original
-    - Si hay listas numeradas, mantén la numeración exacta
-    - Si hay títulos o subtítulos, especifica cuáles son
-    - No resumas el texto, transcríbelo completamente
-    - Para dialogo_narracion: Transcribe LITERALMENTE todo lo que se dice, palabra por palabra, tal como se pronuncia. NO resumas, NO parafrasees, NO interpretes. Incluye muletillas como "eh", "mm", "este", pausas naturales, repeticiones, etc.
-    - Los campos colores_predominantes, ambiente_contexto, duracion_segundos y duracion_formato siempre deben tener valor
-    - Para la duración, analiza todo el contenido del video y proporciona una estimación precisa
-    - El formato de duración debe ser MM:SS para videos menores a 1 hora, o HH:MM:SS para videos de 1 hora o más
-    - Todas las descripciones deben ser en español`;
+    Usa false (booleano) para campos vacíos. Transcribe texto y diálogo literalmente. Todas las descripciones en español.`;
 
     // Detectar el tipo MIME del archivo
     const fileExtension = path.extname(filePath).toLowerCase();
@@ -282,60 +458,26 @@ async function getVideoDescription(filePath) {
 
     console.log(`Procesando video con MIME type: ${mimeType}`);
 
+    // Intentar análisis con cada modelo disponible
     let result;
-    try {
-      console.log(`Iniciando análisis con modelo ${modelUsed}...`);
-      
-      // Configurar timeout para evitar procesos colgados
-      const analysisPromise = model.generateContent([
-        prompt,
-        {
-          inlineData: {
-            data: videoBuffer.toString('base64'),
-            mimeType: mimeType
-          }
-        }
-      ]);
-      
-      // Timeout de 5 minutos para el análisis
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Timeout: El análisis tomó demasiado tiempo')), 5 * 60 * 1000);
-      });
-      
-      result = await model.generateContent([
-        prompt,
-        {
-          inlineData: {
-            data: videoBuffer.toString('base64'),
-            mimeType: mimeType
-          }
-        }
-      ]);
-      
-      console.log(`Análisis completado con modelo ${modelUsed}`);
-    } catch (generateError) {
-      console.error(`Error generando contenido con modelo ${modelUsed}:`, generateError.message);
-
-      // Si falla con el modelo actual y hay más modelos disponibles, intentar con el siguiente
-      if (modelsToTry.indexOf(modelUsed) < modelsToTry.length - 1) {
-        console.log('Intentando con modelo alternativo...');
-        const nextModelIndex = modelsToTry.indexOf(modelUsed) + 1;
-        const nextModel = genAI.getGenerativeModel({ model: modelsToTry[nextModelIndex] });
-        modelUsed = modelsToTry[nextModelIndex];
-        console.log(`Reintentando con modelo: ${modelUsed}`);
-
-        result = await nextModel.generateContent([
-          prompt,
-          {
-            inlineData: {
-              data: videoBuffer.toString('base64'),
-              mimeType: mimeType
-            }
-          }
-        ]);
-      } else {
-        throw generateError;
+    let modelUsed;
+    let lastError;
+    
+    for (const modelConfig of availableModels) {
+      try {
+        const analysisResult = await attemptAnalysis(modelConfig);
+        result = analysisResult.result;
+        modelUsed = analysisResult.modelUsed;
+        break;
+      } catch (error) {
+        lastError = error;
+        console.warn(`❌ Modelo ${modelConfig.name} falló definitivamente:`, error.message);
+        continue;
       }
+    }
+    
+    if (!result) {
+      throw new Error(`Todos los modelos fallaron. Último error: ${lastError?.message || 'Error desconocido'}`);
     }
     
     // Liberar memoria del buffer inmediatamente después del uso
@@ -406,12 +548,16 @@ async function getVideoDescription(filePath) {
     console.error('Error obteniendo descripción:', error.message);
 
     // Proporcionar información más detallada del error
-    if (error.message.includes('404') || error.message.includes('not found')) {
-      throw new Error(`Modelo de Gemini no disponible. Verifica tu API key y que tengas acceso a los modelos de Gemini. Error: ${error.message}`);
+    if (error.message.includes('500') || error.message.includes('Internal Server Error')) {
+      throw new Error(`Servidor de Google Gemini temporalmente no disponible. Intenta nuevamente en unos minutos. Error: ${error.message}`);
+    } else if (error.message.includes('503') || error.message.includes('Service Unavailable')) {
+      throw new Error(`Servicio de Gemini sobrecargado. Intenta nuevamente más tarde. Error: ${error.message}`);
+    } else if (error.message.includes('404') || error.message.includes('not found')) {
+      throw new Error(`Modelo de Gemini no disponible. Verifica tu API key. Error: ${error.message}`);
     } else if (error.message.includes('403') || error.message.includes('permission')) {
-      throw new Error(`Sin permisos para usar Gemini AI. Verifica tu API key y configuración. Error: ${error.message}`);
-    } else if (error.message.includes('quota') || error.message.includes('limit')) {
-      throw new Error(`Límite de cuota excedido en Gemini AI. Error: ${error.message}`);
+      throw new Error(`Sin permisos para usar Gemini AI. Verifica tu API key. Error: ${error.message}`);
+    } else if (error.message.includes('429') || error.message.includes('quota') || error.message.includes('limit')) {
+      throw new Error(`Límite de cuota excedido en Gemini AI. Espera antes de reintentar. Error: ${error.message}`);
     } else {
       throw new Error(`No se pudo obtener la descripción: ${error.message}`);
     }
@@ -442,95 +588,50 @@ app.post('/', async (req, res) => {
 
   console.log(`🎬 Iniciando procesamiento de video: ${videoId} (${currentProcessing}/${MAX_CONCURRENT_REQUESTS})`);
 
-  try {
-    // Verificar si ya existe en la base de datos
-    const existingVideo = await getVideoFromDB(videoId);
-
-    if (existingVideo) {
-      console.log(`✅ Video encontrado en cache: ${videoId}`);
-      // Parsear description si es un JSON string
-      let parsedDescription = existingVideo.description;
-      try {
-        parsedDescription = JSON.parse(existingVideo.description);
-      } catch (e) {
-        // Si no es JSON válido, mantener como string
-        console.warn('Description no es JSON válido, manteniendo como string');
-      }
-
-      // Parsear token usage si existe
-      let tokenUsage = null;
-      if (existingVideo.token_usage) {
-        try {
-          tokenUsage = JSON.parse(existingVideo.token_usage);
-        } catch (e) {
-          console.warn('Error parseando token_usage:', e.message);
-        }
-      }
-
-      return res.json({
-        drive_id: existingVideo.drive_id,
-        description: parsedDescription,
-        cached: true,
-        tokenUsage: tokenUsage
-      });
-    }
-
-    // Si no existe, procesar el video
-    console.log(`Procesando video nuevo: ${videoId}`);
-
-    let filePath;
-    // Descargar video de Google Drive
-    try {
-      filePath = await downloadVideoFromDrive(videoId);
-      console.log(`📥 Video descargado: ${filePath}`);
-    } catch (downloadError) {
-      console.error(`❌ Error descargando video ${videoId}:`, downloadError.message);
-      throw downloadError;
-    }
-
-    let description;
-    let tokenUsage;
-    let modelUsed;
+  // Si hay capacidad, procesar directamente
+  if (currentProcessing < MAX_CONCURRENT_REQUESTS) {
+    currentProcessing++;
     
-    try {
-      // Obtener descripción con Gemini
-      console.log(`🤖 Iniciando análisis con Gemini para ${videoId}...`);
-      const result = await getVideoDescription(filePath);
-      description = result.description;
-      tokenUsage = result.tokenUsage;
-      modelUsed = result.modelUsed;
-      console.log(`✅ Descripción obtenida para ${videoId}`);
-      console.log(`🔧 Modelo utilizado: ${modelUsed}`);
-      console.log(`📊 Tokens utilizados:`, tokenUsage);
-    } catch (analysisError) {
-      console.error(`❌ Error analizando video ${videoId}:`, analysisError.message);
-      throw analysisError;
-    } finally {
-      // Siempre eliminar el archivo temporal
-      if (filePath) {
-        cleanupTempFile(filePath);
-      }
-    }
-
-    // Guardar en base de datos
-    try {
-      await insertVideo(videoId, description, tokenUsage);
-      console.log(`💾 Video guardado en BD: ${videoId}`);
-    } catch (dbError) {
-      console.error(`❌ Error guardando en BD ${videoId}:`, dbError.message);
-      throw dbError;
-    }
-
-    console.log(`🎉 Procesamiento completado exitosamente: ${videoId}`);
+    // Decrementar contador cuando termine la request
+    const originalEnd = res.end;
+    res.end = function(...args) {
+      currentProcessing--;
+      // Procesar siguiente en cola si hay
+      setTimeout(() => processingQueue.processNext(), 1000);
+      originalEnd.apply(this, args);
+    };
     
-    res.json({
-      drive_id: videoId,
-      description: description,
-      cached: false,
-      modelUsed: modelUsed,
-      tokenUsage: tokenUsage
+    // Procesar directamente
+    return await processingQueue.processVideo(videoId, res);
+  } else {
+    // Agregar a la cola
+    console.log(`🔄 Servidor ocupado, agregando video ${videoId} a la cola`);
+    return processingQueue.add(videoId, res);
+  }
+});
+
+// Ruta para obtener estado de la cola
+app.get('/queue-status', (req, res) => {
+  res.json({
+    ...processingQueue.getStatus(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Ruta original simplificada (mantenida para compatibilidad)
+app.post('/process-direct', async (req, res) => {
+  const { videoId } = req.body;
+
+  if (!videoId) {
+    return res.status(400).json({
+      error: 'El campo videoId es requerido'
     });
+  }
 
+  console.log(`🎬 Procesamiento directo de video: ${videoId}`);
+
+  try {
+    await processingQueue.processVideo(videoId, res);
   } catch (error) {
     console.error(`💥 Error procesando video ${videoId}:`, error.message);
     console.error('Stack trace:', error.stack);
@@ -701,7 +802,8 @@ app.get('/health', (req, res) => {
     processing: {
       current: currentProcessing,
       max: MAX_CONCURRENT_REQUESTS,
-      available: MAX_CONCURRENT_REQUESTS - currentProcessing
+      available: MAX_CONCURRENT_REQUESTS - currentProcessing,
+      queue: processingQueue.getStatus()
     },
     memory: {
       used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
@@ -742,6 +844,7 @@ if (!fs.existsSync(tmpDir)) {
 app.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
   console.log(`⚡ Concurrencia máxima: ${MAX_CONCURRENT_REQUESTS} videos simultáneos`);
+  console.log(`📋 Sistema de cola implementado para manejar sobrecarga`);
   console.log(`📊 Base de datos SQLite inicializada`);
   console.log(`🔧 Google Drive API: ${drive ? 'Configurada ✅' : 'No configurada ❌'}`);
   console.log(`🤖 Gemini AI: ${genAI ? 'Configurada ✅' : 'No configurada ❌'}`);
@@ -760,6 +863,7 @@ app.listen(PORT, () => {
 process.on('SIGINT', () => {
   console.log('\n🔄 Cerrando servidor...');
   console.log(`📊 Videos en procesamiento al cerrar: ${currentProcessing}`);
+  console.log(`📋 Videos en cola al cerrar: ${processingQueue.getStatus().queueLength}`);
   db.close();
   console.log('✅ Base de datos cerrada');
   process.exit(0);
@@ -771,11 +875,13 @@ setInterval(() => {
   const memUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
   const memTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
   
-  console.log(`📊 Memoria: ${memUsedMB}/${memTotalMB} MB | Procesando: ${currentProcessing}/${MAX_CONCURRENT_REQUESTS}`);
+  if (memUsedMB > 200) { // Solo mostrar si usa más de 200MB
+    console.log(`📊 Memoria: ${memUsedMB}/${memTotalMB} MB | Procesando: ${currentProcessing}/${MAX_CONCURRENT_REQUESTS}`);
+  }
   
   // Si la memoria supera 1GB, forzar garbage collection
   if (memUsedMB > 1024 && global.gc) {
     console.log('🗑️ Ejecutando garbage collection por alto uso de memoria');
     global.gc();
   }
-}, 30000);
+}, 60000); // Cada minuto en lugar de cada 30 segundos
