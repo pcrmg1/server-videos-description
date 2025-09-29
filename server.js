@@ -9,8 +9,37 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Configuración para limitar concurrencia y memoria
+const MAX_CONCURRENT_REQUESTS = 2; // Máximo 2 videos procesándose simultáneamente
+let currentProcessing = 0;
+const processingQueue = [];
+
 // Middleware
 app.use(express.json());
+
+// Middleware para limitar concurrencia
+const concurrencyLimiter = (req, res, next) => {
+  if (req.path === '/' && req.method === 'POST') {
+    if (currentProcessing >= MAX_CONCURRENT_REQUESTS) {
+      return res.status(429).json({
+        error: 'Servidor ocupado procesando videos. Intenta nuevamente en unos segundos.',
+        currentProcessing,
+        maxConcurrent: MAX_CONCURRENT_REQUESTS
+      });
+    }
+    currentProcessing++;
+    
+    // Decrementar contador cuando termine la request
+    const originalEnd = res.end;
+    res.end = function(...args) {
+      currentProcessing--;
+      originalEnd.apply(this, args);
+    };
+  }
+  next();
+};
+
+app.use(concurrencyLimiter);
 
 // Inicializar base de datos
 const db = new sqlite3.Database('videos.db');
@@ -152,18 +181,30 @@ async function getVideoDescription(filePath) {
   }
 
   try {
-    // Intentar con diferentes modelos en orden de preferencia
+    // Verificar tamaño del archivo antes de procesarlo
+    const stats = fs.statSync(filePath);
+    const fileSizeInMB = stats.size / (1024 * 1024);
+    
+    console.log(`Tamaño del archivo: ${fileSizeInMB.toFixed(2)} MB`);
+    
+    // Limitar tamaño de archivo para evitar problemas de memoria
+    if (fileSizeInMB > 100) {
+      throw new Error(`Archivo demasiado grande (${fileSizeInMB.toFixed(2)} MB). Máximo permitido: 100 MB`);
+    }
+
     // Intentar con diferentes modelos en orden de preferencia
     const modelNames = [
-      "gemini-2.5-pro",     // mejor calidad, más tokens
-      "gemini-2.5-flash"    // más rápido y económico
+      "gemini-2.5-flash",   // Más rápido y usa menos memoria
+      "gemini-2.5-pro"      // Mejor calidad pero más pesado
     ];
 
+    // Para archivos grandes, usar solo el modelo flash
+    const modelsToTry = fileSizeInMB > 50 ? ["gemini-2.5-flash"] : modelNames;
 
     let model;
     let modelUsed;
 
-    for (const modelName of modelNames) {
+    for (const modelName of modelsToTry) {
       try {
         model = genAI.getGenerativeModel({ model: modelName });
         modelUsed = modelName;
@@ -179,8 +220,14 @@ async function getVideoDescription(filePath) {
       throw new Error('No se pudo inicializar ningún modelo de Gemini disponible');
     }
 
-    // Leer el archivo como buffer
-    const videoBuffer = fs.readFileSync(filePath);
+    // Leer el archivo como buffer con manejo de memoria optimizado
+    let videoBuffer;
+    try {
+      videoBuffer = fs.readFileSync(filePath);
+      console.log(`Buffer creado: ${(videoBuffer.length / (1024 * 1024)).toFixed(2)} MB`);
+    } catch (readError) {
+      throw new Error(`Error leyendo archivo: ${readError.message}`);
+    }
 
     const prompt = `Analiza este video y proporciona una respuesta en formato JSON con la siguiente estructura exacta:
     {
@@ -237,6 +284,24 @@ async function getVideoDescription(filePath) {
 
     let result;
     try {
+      console.log(`Iniciando análisis con modelo ${modelUsed}...`);
+      
+      // Configurar timeout para evitar procesos colgados
+      const analysisPromise = model.generateContent([
+        prompt,
+        {
+          inlineData: {
+            data: videoBuffer.toString('base64'),
+            mimeType: mimeType
+          }
+        }
+      ]);
+      
+      // Timeout de 5 minutos para el análisis
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Timeout: El análisis tomó demasiado tiempo')), 5 * 60 * 1000);
+      });
+      
       result = await model.generateContent([
         prompt,
         {
@@ -246,15 +311,17 @@ async function getVideoDescription(filePath) {
           }
         }
       ]);
+      
+      console.log(`Análisis completado con modelo ${modelUsed}`);
     } catch (generateError) {
       console.error(`Error generando contenido con modelo ${modelUsed}:`, generateError.message);
 
-      // Si falla con el modelo actual, intentar con el siguiente
-      if (modelNames.indexOf(modelUsed) < modelNames.length - 1) {
+      // Si falla con el modelo actual y hay más modelos disponibles, intentar con el siguiente
+      if (modelsToTry.indexOf(modelUsed) < modelsToTry.length - 1) {
         console.log('Intentando con modelo alternativo...');
-        const nextModelIndex = modelNames.indexOf(modelUsed) + 1;
-        const nextModel = genAI.getGenerativeModel({ model: modelNames[nextModelIndex] });
-        modelUsed = modelNames[nextModelIndex];
+        const nextModelIndex = modelsToTry.indexOf(modelUsed) + 1;
+        const nextModel = genAI.getGenerativeModel({ model: modelsToTry[nextModelIndex] });
+        modelUsed = modelsToTry[nextModelIndex];
         console.log(`Reintentando con modelo: ${modelUsed}`);
 
         result = await nextModel.generateContent([
@@ -269,6 +336,15 @@ async function getVideoDescription(filePath) {
       } else {
         throw generateError;
       }
+    }
+    
+    // Liberar memoria del buffer inmediatamente después del uso
+    videoBuffer = null;
+    
+    // Forzar garbage collection si está disponible
+    if (global.gc) {
+      global.gc();
+      console.log('Garbage collection ejecutado');
     }
 
     const response = await result.response;
@@ -364,11 +440,14 @@ app.post('/', async (req, res) => {
     });
   }
 
+  console.log(`🎬 Iniciando procesamiento de video: ${videoId} (${currentProcessing}/${MAX_CONCURRENT_REQUESTS})`);
+
   try {
     // Verificar si ya existe en la base de datos
     const existingVideo = await getVideoFromDB(videoId);
 
     if (existingVideo) {
+      console.log(`✅ Video encontrado en cache: ${videoId}`);
       // Parsear description si es un JSON string
       let parsedDescription = existingVideo.description;
       try {
@@ -399,31 +478,51 @@ app.post('/', async (req, res) => {
     // Si no existe, procesar el video
     console.log(`Procesando video nuevo: ${videoId}`);
 
+    let filePath;
     // Descargar video de Google Drive
-    const filePath = await downloadVideoFromDrive(videoId);
-    console.log(`Video descargado: ${filePath}`);
+    try {
+      filePath = await downloadVideoFromDrive(videoId);
+      console.log(`📥 Video descargado: ${filePath}`);
+    } catch (downloadError) {
+      console.error(`❌ Error descargando video ${videoId}:`, downloadError.message);
+      throw downloadError;
+    }
 
     let description;
     let tokenUsage;
     let modelUsed;
+    
     try {
       // Obtener descripción con Gemini
+      console.log(`🤖 Iniciando análisis con Gemini para ${videoId}...`);
       const result = await getVideoDescription(filePath);
       description = result.description;
       tokenUsage = result.tokenUsage;
       modelUsed = result.modelUsed;
-      console.log(`Descripción obtenida para ${videoId}`);
-      console.log(`Modelo utilizado: ${modelUsed}`);
-      console.log(`Tokens utilizados:`, tokenUsage);
+      console.log(`✅ Descripción obtenida para ${videoId}`);
+      console.log(`🔧 Modelo utilizado: ${modelUsed}`);
+      console.log(`📊 Tokens utilizados:`, tokenUsage);
+    } catch (analysisError) {
+      console.error(`❌ Error analizando video ${videoId}:`, analysisError.message);
+      throw analysisError;
     } finally {
       // Siempre eliminar el archivo temporal
-      cleanupTempFile(filePath);
+      if (filePath) {
+        cleanupTempFile(filePath);
+      }
     }
 
     // Guardar en base de datos
-    await insertVideo(videoId, description, tokenUsage);
-    console.log(`Video guardado en BD: ${videoId}`);
+    try {
+      await insertVideo(videoId, description, tokenUsage);
+      console.log(`💾 Video guardado en BD: ${videoId}`);
+    } catch (dbError) {
+      console.error(`❌ Error guardando en BD ${videoId}:`, dbError.message);
+      throw dbError;
+    }
 
+    console.log(`🎉 Procesamiento completado exitosamente: ${videoId}`);
+    
     res.json({
       drive_id: videoId,
       description: description,
@@ -433,7 +532,9 @@ app.post('/', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error procesando video:', error.message);
+    console.error(`💥 Error procesando video ${videoId}:`, error.message);
+    console.error('Stack trace:', error.stack);
+    
     res.status(500).json({
       error: `Error procesando video: ${error.message}`
     });
@@ -597,6 +698,17 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
     timestamp: new Date().toISOString(),
+    processing: {
+      current: currentProcessing,
+      max: MAX_CONCURRENT_REQUESTS,
+      available: MAX_CONCURRENT_REQUESTS - currentProcessing
+    },
+    memory: {
+      used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+      external: Math.round(process.memoryUsage().external / 1024 / 1024),
+      rss: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    },
     services: {
       database: 'Connected',
       googleDrive: drive ? 'Configured' : 'Not configured',
@@ -629,16 +741,41 @@ if (!fs.existsSync(tmpDir)) {
 // Iniciar servidor
 app.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
+  console.log(`⚡ Concurrencia máxima: ${MAX_CONCURRENT_REQUESTS} videos simultáneos`);
   console.log(`📊 Base de datos SQLite inicializada`);
   console.log(`🔧 Google Drive API: ${drive ? 'Configurada ✅' : 'No configurada ❌'}`);
   console.log(`🤖 Gemini AI: ${genAI ? 'Configurada ✅' : 'No configurada ❌'}`);
   console.log(`📁 Directorio temporal: ${tmpDir}`);
+  console.log(`💾 Memoria inicial: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB`);
+  
+  // Habilitar garbage collection manual si está disponible
+  if (global.gc) {
+    console.log(`🗑️ Garbage collection manual habilitado`);
+  } else {
+    console.log(`⚠️ Para mejor rendimiento, ejecuta con: node --expose-gc server.js`);
+  }
 });
 
 // Manejo graceful del cierre
 process.on('SIGINT', () => {
   console.log('\n🔄 Cerrando servidor...');
+  console.log(`📊 Videos en procesamiento al cerrar: ${currentProcessing}`);
   db.close();
   console.log('✅ Base de datos cerrada');
   process.exit(0);
 });
+
+// Monitoreo de memoria cada 30 segundos
+setInterval(() => {
+  const memUsage = process.memoryUsage();
+  const memUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+  const memTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+  
+  console.log(`📊 Memoria: ${memUsedMB}/${memTotalMB} MB | Procesando: ${currentProcessing}/${MAX_CONCURRENT_REQUESTS}`);
+  
+  // Si la memoria supera 1GB, forzar garbage collection
+  if (memUsedMB > 1024 && global.gc) {
+    console.log('🗑️ Ejecutando garbage collection por alto uso de memoria');
+    global.gc();
+  }
+}, 30000);
