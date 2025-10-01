@@ -436,7 +436,7 @@ async function downloadVideoFromDrive(videoId) {
     const fileSize = parseInt(fileMetadata.data.size) || 0;
     
     // Verificar tamaño antes de descargar
-    if (fileSize > 100 * 1024 * 1024) { // 100MB límite
+    if (fileSize > 150 * 1024 * 1024) { // 100MB límite
       throw new Error(`Archivo demasiado grande: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
     }
 
@@ -1002,4 +1002,9 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000); // Cada 10 minutos
 
-console.log('🎯 Sistema de procesamiento de videos iniciado correctamente');
+
+
+
+
+
+
