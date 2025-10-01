@@ -506,12 +506,12 @@ async function getVideoDescription(filePath) {
     
     console.log(`📊 Tamaño del archivo: ${fileSizeInMB.toFixed(2)} MB`);
     
-    if (fileSizeInMB > 50) {
+    if (fileSizeInMB > 150) {
       throw new Error(`Archivo demasiado grande (${fileSizeInMB.toFixed(2)} MB). Máximo: 50 MB`);
     }
 
     const modelConfigs = [
-      { name: "gemini-2.5-flash", maxSizeMB: 50 },
+      { name: "gemini-2.5-flash", maxSizeMB: 150 },
       { name: "gemini-2.5-pro", maxSizeMB: 30 }
     ];
 
