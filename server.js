@@ -436,7 +436,7 @@ async function downloadVideoFromDrive(videoId) {
     const fileSize = parseInt(fileMetadata.data.size) || 0;
     
     // Verificar tamaño antes de descargar
-    if (fileSize > 150 * 1024 * 1024) { // 100MB límite
+    if (fileSize > 500 * 1024 * 1024) { // 100MB límite
       throw new Error(`Archivo demasiado grande: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
     }
 
@@ -506,12 +506,12 @@ async function getVideoDescription(filePath) {
     
     console.log(`📊 Tamaño del archivo: ${fileSizeInMB.toFixed(2)} MB`);
     
-    if (fileSizeInMB > 150) {
+    if (fileSizeInMB > 500) {
       throw new Error(`Archivo demasiado grande (${fileSizeInMB.toFixed(2)} MB). Máximo: 50 MB`);
     }
 
     const modelConfigs = [
-      { name: "gemini-2.5-flash", maxSizeMB: 150 },
+      { name: "gemini-2.5-flash", maxSizeMB: 500 },
       { name: "gemini-2.5-pro", maxSizeMB: 30 }
     ];
 
